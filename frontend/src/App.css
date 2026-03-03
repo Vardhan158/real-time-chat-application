@@ -184,10 +184,81 @@
 	margin: 0;
 }
 
+.chat-header-top {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+}
+
 .chat-header p {
 	margin: 4px 0 0;
 	color: #6b7280;
 	font-size: 0.9rem;
+}
+
+.call-controls {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.call-controls span {
+	font-size: 0.85rem;
+	color: #4b5563;
+}
+
+.call-controls button {
+	border: 1px solid #d1d5db;
+	background: #ffffff;
+	border-radius: 8px;
+	padding: 6px 10px;
+	font-size: 0.85rem;
+	cursor: pointer;
+}
+
+.video-call-panel {
+	background: #ffffff;
+	border-bottom: 1px solid #e5e7eb;
+	padding: 12px 24px 16px;
+}
+
+.video-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+}
+
+.video-card {
+	border: 1px solid #e5e7eb;
+	border-radius: 12px;
+	padding: 8px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	background: #f9fafb;
+}
+
+.video-card span {
+	font-size: 0.8rem;
+	color: #4b5563;
+}
+
+.video-card video,
+.video-placeholder {
+	width: 100%;
+	height: 170px;
+	border-radius: 8px;
+	background: #111827;
+	object-fit: cover;
+}
+
+.video-placeholder {
+	display: grid;
+	place-items: center;
+	font-size: 0.85rem;
+	color: #e5e7eb;
 }
 
 .chat-messages {
@@ -299,6 +370,10 @@
 
 	.chat-main {
 		height: 100vh;
+	}
+
+	.video-grid {
+		grid-template-columns: 1fr;
 	}
 
 	.message {

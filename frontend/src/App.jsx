@@ -5,6 +5,9 @@ import "./App.css";
 
 const API_BASE_URL = "http://localhost:5000";
 const AUTH_STORAGE_KEY = "chat-auth";
+const RTC_CONFIGURATION = {
+  iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+};
 
 function App() {
   const [auth, setAuth] = useState(() => {
@@ -25,8 +28,20 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [typingByChat, setTypingByChat] = useState({});
+  const [callState, setCallState] = useState("idle");
+  const [callChatId, setCallChatId] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
   const socketRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const localVideoRef = useRef(null);
+  const remoteVideoRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const peerConnectionRef = useRef(null);
+  const callChatIdRef = useRef(null);
+  const incomingCallChatIdRef = useRef(null);
+  const pendingCandidatesRef = useRef([]);
 
   const authHeaders = auth?.token
     ? { Authorization: `Bearer ${auth.token}` }
@@ -106,6 +121,178 @@ function App() {
     setActiveChatId((current) => current ?? incomingChat._id);
   };
 
+  const setIncomingCallState = (callData) => {
+    incomingCallChatIdRef.current = callData?.chatId ?? null;
+    setIncomingCall(callData);
+  };
+
+  const resetCallResources = () => {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+
+    pendingCandidatesRef.current = [];
+    callChatIdRef.current = null;
+    incomingCallChatIdRef.current = null;
+    setLocalStream(null);
+    setRemoteStream(null);
+    setCallChatId(null);
+    setIncomingCall(null);
+    setCallState("idle");
+  };
+
+  const initializeLocalStream = async () => {
+    if (localStreamRef.current) {
+      return localStreamRef.current;
+    }
+
+    const mediaStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
+    });
+
+    localStreamRef.current = mediaStream;
+    setLocalStream(mediaStream);
+    return mediaStream;
+  };
+
+  const createPeerConnection = (chatId) => {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+    }
+
+    const connection = new RTCPeerConnection(RTC_CONFIGURATION);
+    peerConnectionRef.current = connection;
+    callChatIdRef.current = chatId;
+    setCallChatId(chatId);
+    setRemoteStream(null);
+
+    if (localStreamRef.current) {
+      localStreamRef.current
+        .getTracks()
+        .forEach((track) => connection.addTrack(track, localStreamRef.current));
+    }
+
+    connection.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (stream) {
+        setRemoteStream(stream);
+      }
+    };
+
+    connection.onicecandidate = (event) => {
+      if (!event.candidate || !socketRef.current) {
+        return;
+      }
+
+      socketRef.current.emit("call_ice_candidate", {
+        chatId,
+        candidate: event.candidate,
+      });
+    };
+
+    return connection;
+  };
+
+  const flushPendingCandidates = async () => {
+    if (!peerConnectionRef.current || pendingCandidatesRef.current.length === 0) {
+      return;
+    }
+
+    const candidates = [...pendingCandidatesRef.current];
+    pendingCandidatesRef.current = [];
+
+    await Promise.all(
+      candidates.map((candidate) =>
+        peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate)),
+      ),
+    );
+  };
+
+  const handleStartCall = async () => {
+    if (!activeChat?._id || !socketRef.current) {
+      return;
+    }
+
+    try {
+      await initializeLocalStream();
+      const connection = createPeerConnection(activeChat._id);
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+
+      socketRef.current.emit("call_offer", {
+        chatId: activeChat._id,
+        offer,
+      });
+
+      setIncomingCallState(null);
+      setCallState("calling");
+      setError("");
+    } catch {
+      resetCallResources();
+      setError("Unable to start video call. Check camera/microphone permission.");
+    }
+  };
+
+  const handleAcceptCall = async () => {
+    if (!incomingCall || !socketRef.current) {
+      return;
+    }
+
+    try {
+      await initializeLocalStream();
+      const connection = createPeerConnection(incomingCall.chatId);
+      await connection.setRemoteDescription(new RTCSessionDescription(incomingCall.offer));
+      await flushPendingCandidates();
+
+      const answer = await connection.createAnswer();
+      await connection.setLocalDescription(answer);
+
+      socketRef.current.emit("call_answer", {
+        chatId: incomingCall.chatId,
+        answer,
+      });
+
+      setActiveChatId(incomingCall.chatId);
+      setIncomingCallState(null);
+      setCallState("in-call");
+      setError("");
+    } catch {
+      resetCallResources();
+      setError("Unable to join video call. Try again.");
+    }
+  };
+
+  const handleRejectCall = () => {
+    if (!incomingCall || !socketRef.current) {
+      return;
+    }
+
+    socketRef.current.emit("call_reject", {
+      chatId: incomingCall.chatId,
+    });
+
+    setIncomingCallState(null);
+    setCallState("idle");
+    setCallChatId(null);
+  };
+
+  const handleEndCall = () => {
+    if (socketRef.current && callChatIdRef.current) {
+      socketRef.current.emit("call_end", {
+        chatId: callChatIdRef.current,
+      });
+    }
+
+    resetCallResources();
+  };
+
   const handleAuthSubmit = async (event) => {
     event.preventDefault();
 
@@ -134,6 +321,7 @@ function App() {
   };
 
   const handleLogout = () => {
+    resetCallResources();
     sessionStorage.removeItem(AUTH_STORAGE_KEY);
     setAuth(null);
     setUsers([]);
@@ -213,6 +401,18 @@ function App() {
   }, [auth?.token]);
 
   useEffect(() => {
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = localStream;
+    }
+  }, [localStream]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = remoteStream;
+    }
+  }, [remoteStream]);
+
+  useEffect(() => {
     if (!auth?.token) {
       return undefined;
     }
@@ -247,7 +447,82 @@ function App() {
       });
     });
 
+    socket.on("call_offer", ({ chatId, fromUserName, offer }) => {
+      if (!chatId || !offer) {
+        return;
+      }
+
+      setActiveChatId((current) => current ?? chatId);
+      setCallChatId(chatId);
+      setCallState("ringing");
+      setIncomingCallState({
+        chatId,
+        fromUserName,
+        offer,
+      });
+    });
+
+    socket.on("call_answer", async ({ chatId, answer }) => {
+      if (!chatId || !answer || chatId !== callChatIdRef.current || !peerConnectionRef.current) {
+        return;
+      }
+
+      try {
+        await peerConnectionRef.current.setRemoteDescription(
+          new RTCSessionDescription(answer),
+        );
+        await flushPendingCandidates();
+        setCallState("in-call");
+      } catch {
+        resetCallResources();
+        setError("Video call connection failed.");
+      }
+    });
+
+    socket.on("call_ice_candidate", async ({ chatId, candidate }) => {
+      if (!chatId || !candidate) {
+        return;
+      }
+
+      if (chatId !== callChatIdRef.current || !peerConnectionRef.current) {
+        pendingCandidatesRef.current.push(candidate);
+        return;
+      }
+
+      try {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // ignore invalid candidate events
+      }
+    });
+
+    socket.on("call_end", ({ chatId }) => {
+      if (!chatId) {
+        return;
+      }
+
+      const isCurrentCall = chatId === callChatIdRef.current;
+      const isIncomingCall = chatId === incomingCallChatIdRef.current;
+
+      if (!isCurrentCall && !isIncomingCall) {
+        return;
+      }
+
+      resetCallResources();
+      setError("Video call ended.");
+    });
+
+    socket.on("call_reject", ({ chatId, fromUserName }) => {
+      if (!chatId || chatId !== callChatIdRef.current) {
+        return;
+      }
+
+      resetCallResources();
+      setError(`${fromUserName || "User"} rejected the video call.`);
+    });
+
     return () => {
+      resetCallResources();
       socketRef.current = null;
       socket.disconnect();
     };
@@ -377,9 +652,72 @@ function App() {
         ) : (
           <>
             <header className="chat-header">
-              <h3>{getChatTitle(activeChat)}</h3>
-              <p>{activeChat.status}</p>
+              <div className="chat-header-top">
+                <div>
+                  <h3>{getChatTitle(activeChat)}</h3>
+                  <p>{activeChat.status}</p>
+                </div>
+
+                <div className="call-controls">
+                  {callState === "idle" ? (
+                    <button type="button" onClick={handleStartCall}>
+                      Video Call
+                    </button>
+                  ) : null}
+
+                  {callState === "calling" && callChatId === activeChat._id ? (
+                    <>
+                      <span>Calling...</span>
+                      <button type="button" onClick={handleEndCall}>
+                        Cancel
+                      </button>
+                    </>
+                  ) : null}
+
+                  {callState === "ringing" && incomingCall?.chatId === activeChat._id ? (
+                    <>
+                      <span>{incomingCall.fromUserName} is calling...</span>
+                      <button type="button" onClick={handleAcceptCall}>
+                        Accept
+                      </button>
+                      <button type="button" onClick={handleRejectCall}>
+                        Reject
+                      </button>
+                    </>
+                  ) : null}
+
+                  {callState === "in-call" && callChatId === activeChat._id ? (
+                    <button type="button" onClick={handleEndCall}>
+                      End Call
+                    </button>
+                  ) : null}
+                </div>
+              </div>
             </header>
+
+            {(callChatId === activeChat._id || incomingCall?.chatId === activeChat._id) && (
+              <section className="video-call-panel">
+                <div className="video-grid">
+                  <div className="video-card">
+                    <span>You</span>
+                    {localStream ? (
+                      <video ref={localVideoRef} autoPlay muted playsInline />
+                    ) : (
+                      <div className="video-placeholder">Camera preview</div>
+                    )}
+                  </div>
+
+                  <div className="video-card">
+                    <span>{getChatTitle(activeChat)}</span>
+                    {remoteStream ? (
+                      <video ref={remoteVideoRef} autoPlay playsInline />
+                    ) : (
+                      <div className="video-placeholder">Waiting for remote video...</div>
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
 
             <section className="chat-messages">
               {activeChat.messages.map((message) => (

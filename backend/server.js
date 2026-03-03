@@ -63,6 +63,29 @@ const DNS_SERVERS = (process.env.DNS_SERVERS || "8.8.8.8,1.1.1.1")
   .filter(Boolean);
 
 io.on("connection", (socket) => {
+  const getParticipantIds = async (chatId) => {
+    if (!chatId) {
+      return [];
+    }
+
+    const chat = await Chat.findById(chatId).select("participants");
+    if (!chat) {
+      return [];
+    }
+
+    const isParticipant = chat.participants.some(
+      (participant) => participant.id.toString() === socket.user.id,
+    );
+
+    if (!isParticipant) {
+      return [];
+    }
+
+    return chat.participants
+      .map((participant) => participant.id.toString())
+      .filter((participantId) => participantId !== socket.user.id);
+  };
+
   if (socket.user?.id) {
     socket.join(`user:${socket.user.id}`);
   }
@@ -71,29 +94,8 @@ io.on("connection", (socket) => {
 
   socket.on("typing", async ({ chatId, isTyping }) => {
     try {
-      if (!chatId) {
-        return;
-      }
-
-      const chat = await Chat.findById(chatId).select("participants");
-      if (!chat) {
-        return;
-      }
-
-      const isParticipant = chat.participants.some(
-        (participant) => participant.id.toString() === socket.user.id,
-      );
-
-      if (!isParticipant) {
-        return;
-      }
-
-      chat.participants.forEach((participant) => {
-        const participantId = participant.id.toString();
-        if (participantId === socket.user.id) {
-          return;
-        }
-
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
         io.to(`user:${participantId}`).emit("typing", {
           chatId,
           userId: socket.user.id,
@@ -103,6 +105,81 @@ io.on("connection", (socket) => {
       });
     } catch (_error) {
       // ignore typing relay errors
+    }
+  });
+
+  socket.on("call_offer", async ({ chatId, offer }) => {
+    try {
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit("call_offer", {
+          chatId,
+          fromUserId: socket.user.id,
+          fromUserName: socket.user.name,
+          offer,
+        });
+      });
+    } catch (_error) {
+      // ignore call offer relay errors
+    }
+  });
+
+  socket.on("call_answer", async ({ chatId, answer }) => {
+    try {
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit("call_answer", {
+          chatId,
+          fromUserId: socket.user.id,
+          answer,
+        });
+      });
+    } catch (_error) {
+      // ignore call answer relay errors
+    }
+  });
+
+  socket.on("call_ice_candidate", async ({ chatId, candidate }) => {
+    try {
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit("call_ice_candidate", {
+          chatId,
+          fromUserId: socket.user.id,
+          candidate,
+        });
+      });
+    } catch (_error) {
+      // ignore ice candidate relay errors
+    }
+  });
+
+  socket.on("call_end", async ({ chatId }) => {
+    try {
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit("call_end", {
+          chatId,
+          fromUserId: socket.user.id,
+        });
+      });
+    } catch (_error) {
+      // ignore call end relay errors
+    }
+  });
+
+  socket.on("call_reject", async ({ chatId }) => {
+    try {
+      const participantIds = await getParticipantIds(chatId);
+      participantIds.forEach((participantId) => {
+        io.to(`user:${participantId}`).emit("call_reject", {
+          chatId,
+          fromUserId: socket.user.id,
+          fromUserName: socket.user.name,
+        });
+      });
+    } catch (_error) {
+      // ignore call reject relay errors
     }
   });
 
