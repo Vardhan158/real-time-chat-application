@@ -3,7 +3,7 @@ import axios from "axios";
 import { io } from "socket.io-client";
 import "./App.css";
 
-const API_BASE_URL = "http://localhost:5000";
+const API_BASE_URL = "https://real-time-chat-backend-uvr5.onrender.com";
 const AUTH_STORAGE_KEY = "chat-auth";
 
 function App() {
