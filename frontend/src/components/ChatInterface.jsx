@@ -35,11 +35,13 @@ function ChatInterface({ auth, onLogout }) {
   const callChatIdRef = useRef(null);
   const callStateRef = useRef("idle");
   const incomingNotificationRef = useRef(null);
+  const messageNotificationsRef = useRef(new Map());
   const incomingCallChatIdRef = useRef(null);
   const pendingCandidatesRef = useRef([]);
   const [timestampUpdate, setTimestampUpdate] = useState(0);
   const [searchTerm, setSearchTerm] = useState("");
   const [unreadByChat, setUnreadByChat] = useState({});
+  const [notificationPermission, setNotificationPermission] = useState("unsupported");
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -47,6 +49,15 @@ function ChatInterface({ auth, onLogout }) {
     }, 60000); // Update every minute
 
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+
+    setNotificationPermission(Notification.permission);
   }, []);
 
   const authHeaders = auth?.token
@@ -138,12 +149,26 @@ function ChatInterface({ auth, onLogout }) {
       }),
     );
 
-    // Increment unread count if message is not from current user and chat is not active
-    if (messageWithTimestamp.senderId !== auth.user.id && chatId !== activeChatId) {
-      setUnreadByChat((prev) => ({
-        ...prev,
-        [chatId]: (prev[chatId] || 0) + 1,
-      }));
+    if (messageWithTimestamp.senderId !== auth.user.id) {
+      const shouldIncrementUnread = chatId !== activeChatId;
+      const shouldNotifyInBrowser =
+        shouldIncrementUnread ||
+        (typeof document !== "undefined" && (document.hidden || !document.hasFocus()));
+
+      if (shouldIncrementUnread) {
+        setUnreadByChat((prev) => ({
+          ...prev,
+          [chatId]: (prev[chatId] || 0) + 1,
+        }));
+      }
+
+      if (shouldNotifyInBrowser) {
+        notifyIncomingMessage({
+          chatId,
+          senderName: messageWithTimestamp.senderName,
+          text: messageWithTimestamp.text,
+        });
+      }
     }
 
     setTypingByChat((prev) => {
@@ -204,21 +229,56 @@ function ChatInterface({ auth, onLogout }) {
     incomingNotificationRef.current = null;
   };
 
+  const closeMessageNotification = (chatId) => {
+    const notification = messageNotificationsRef.current.get(chatId);
+    if (!notification) {
+      return;
+    }
+
+    notification.close();
+    messageNotificationsRef.current.delete(chatId);
+  };
+
+  const closeAllMessageNotifications = () => {
+    messageNotificationsRef.current.forEach((notification) => {
+      notification.close();
+    });
+    messageNotificationsRef.current.clear();
+  };
+
   const requestNotificationPermission = async () => {
     if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
       return "unsupported";
     }
 
     if (Notification.permission !== "default") {
+      setNotificationPermission(Notification.permission);
       return Notification.permission;
     }
 
     try {
-      return await Notification.requestPermission();
+      const permission = await Notification.requestPermission();
+      setNotificationPermission(permission);
+      return permission;
     } catch {
+      setNotificationPermission("denied");
       return "denied";
     }
   };
+
+  const handleEnableNotifications = async () => {
+    await requestNotificationPermission();
+  };
+
+  const notificationStatusLabel =
+    notificationPermission === "granted"
+      ? "Notifications on"
+      : notificationPermission === "denied"
+        ? "Notifications blocked"
+        : notificationPermission === "default"
+          ? "Notifications off"
+          : "Notifications unsupported";
 
   const notifyIncomingCall = async ({ chatId, fromUserName }) => {
     const permission = await requestNotificationPermission();
@@ -241,6 +301,33 @@ function ChatInterface({ auth, onLogout }) {
     };
 
     incomingNotificationRef.current = notification;
+  };
+
+  const notifyIncomingMessage = async ({ chatId, senderName, text }) => {
+    const permission = await requestNotificationPermission();
+    if (permission !== "granted" || typeof window === "undefined") {
+      return;
+    }
+
+    closeMessageNotification(chatId);
+
+    const chat = chats.find((item) => item._id === chatId);
+    const notification = new Notification(senderName || getChatTitle(chat), {
+      body: text.length > 100 ? `${text.slice(0, 100)}...` : text,
+      tag: `message:${chatId}`,
+    });
+
+    notification.onclick = () => {
+      window.focus();
+      setActiveChatId(chatId);
+      closeMessageNotification(chatId);
+    };
+
+    notification.onclose = () => {
+      messageNotificationsRef.current.delete(chatId);
+    };
+
+    messageNotificationsRef.current.set(chatId, notification);
   };
 
   const resetCallResources = () => {
@@ -727,6 +814,7 @@ function ChatInterface({ auth, onLogout }) {
         ...prev,
         [activeChatId]: 0,
       }));
+      closeMessageNotification(activeChatId);
     }
   }, [activeChatId]);
 
@@ -736,6 +824,7 @@ function ChatInterface({ auth, onLogout }) {
     }
 
     closeIncomingNotification();
+    closeAllMessageNotifications();
   }, []);
 
   const filteredUsers = users.filter((user) =>
@@ -820,14 +909,24 @@ function ChatInterface({ auth, onLogout }) {
   return (
     <div className="flex min-h-screen bg-gray-100">
       <aside className="flex w-80 max-w-full shrink-0 flex-col border-r border-gray-200 bg-white">
-        <header className="p-4 border-b border-gray-200 flex items-center">
-          <div className="flex items-center space-x-2">
+        <header className="p-4 border-b border-gray-200">
+          <div className="flex items-center justify-between gap-3">
             <span className="font-medium text-gray-900">{auth.user.name}</span>
             <button
               onClick={handleLogout}
               className="px-3 py-1 text-sm bg-red-500 text-white rounded hover:bg-red-600"
             >
               Logout
+            </button>
+          </div>
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <span className="text-xs text-gray-500">{notificationStatusLabel}</span>
+            <button
+              onClick={handleEnableNotifications}
+              disabled={notificationPermission === "granted" || notificationPermission === "unsupported"}
+              className="px-3 py-1 text-xs bg-slate-800 text-white rounded hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {notificationPermission === "granted" ? "Enabled" : "Enable notifications"}
             </button>
           </div>
         </header>
