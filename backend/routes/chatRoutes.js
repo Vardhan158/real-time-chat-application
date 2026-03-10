@@ -2,6 +2,7 @@ const express = require("express");
 const Chat = require("../models/Chat");
 const User = require("../models/User");
 const authMiddleware = require("../middleware/authMiddleware");
+const { sendNotificationToUser } = require("../services/pushService");
 
 const router = express.Router();
 
@@ -137,6 +138,29 @@ router.post("/:chatId/messages", async (req, res) => {
         io.to(`user:${participant.id.toString()}`).emit("message_created", payload);
       });
     }
+
+    const notificationTitle =
+      chat.participants.find((participant) => participant.id.toString() !== req.user.id)?.name ||
+      req.user.name;
+
+    await Promise.all(
+      chat.participants
+        .filter((participant) => participant.id.toString() !== req.user.id)
+        .map((participant) =>
+          sendNotificationToUser(participant.id.toString(), {
+            title: req.user.name,
+            body: savedMessage.text,
+            tag: `message:${chat._id.toString()}`,
+            url: `/?chatId=${chat._id.toString()}`,
+            data: {
+              chatId: chat._id.toString(),
+              senderId: req.user.id,
+              senderName: req.user.name,
+              chatTitle: notificationTitle,
+            },
+          }),
+        ),
+    );
 
     res.status(201).json(savedMessage);
   } catch (error) {

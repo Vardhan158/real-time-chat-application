@@ -53,6 +53,7 @@ app.use(express.json());
 app.use("/api/users", require("./routes/userRoutes"));
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/chats", require("./routes/chatRoutes"));
+app.use("/api/push", require("./routes/pushRoutes"));
 
 // Environment Variables
 const PORT = process.env.PORT || 5000;
