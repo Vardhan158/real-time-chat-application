@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import { io } from "socket.io-client";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "https://real-time-chat-backend-uvr5.onrender.com";
+const API_BASE_URL =
+  import.meta.env.VITE_API_URL || "https://real-time-chat-backend-uvr5.onrender.com";
 const RTC_CONFIGURATION = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
@@ -32,6 +33,8 @@ function ChatInterface({ auth, onLogout }) {
   const localStreamRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const pushRegistrationRef = useRef(null);
+  const pushApiBaseUrlRef = useRef(null);
+  const pushApiUnavailableRef = useRef(false);
   const callChatIdRef = useRef(null);
   const callStateRef = useRef("idle");
   const incomingNotificationRef = useRef(null);
@@ -43,6 +46,12 @@ function ChatInterface({ auth, onLogout }) {
   const [unreadByChat, setUnreadByChat] = useState({});
   const [notificationPermission, setNotificationPermission] = useState("unsupported");
   const [pushSubscriptionStatus, setPushSubscriptionStatus] = useState("unsupported");
+  const [pushDebug, setPushDebug] = useState({
+    serviceWorker: "unregistered",
+    apiBaseUrl: "not resolved",
+    endpoint: "not subscribed",
+    lastResult: "idle",
+  });
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -71,13 +80,27 @@ function ChatInterface({ auth, onLogout }) {
       try {
         const registration = await navigator.serviceWorker.register("/sw.js");
         pushRegistrationRef.current = registration;
+        setPushDebug((prev) => ({
+          ...prev,
+          serviceWorker: "registered",
+        }));
 
         const existingSubscription = await registration.pushManager.getSubscription();
         if (existingSubscription) {
           setPushSubscriptionStatus("subscribed");
+          setPushDebug((prev) => ({
+            ...prev,
+            endpoint: existingSubscription.endpoint,
+            lastResult: "existing subscription found",
+          }));
         }
       } catch {
         setPushSubscriptionStatus("error");
+        setPushDebug((prev) => ({
+          ...prev,
+          serviceWorker: "registration failed",
+          lastResult: "service worker registration failed",
+        }));
       }
     };
 
@@ -303,7 +326,103 @@ function ChatInterface({ auth, onLogout }) {
 
     const registration = await navigator.serviceWorker.register("/sw.js");
     pushRegistrationRef.current = registration;
+    setPushDebug((prev) => ({
+      ...prev,
+      serviceWorker: "registered",
+    }));
     return registration;
+  };
+
+  const getPushApiBaseUrls = () => {
+    const candidates = [API_BASE_URL];
+
+    if (typeof window !== "undefined" && window.location?.origin) {
+      candidates.push(window.location.origin);
+    }
+
+    return [...new Set(candidates.filter(Boolean))];
+  };
+
+  const getPushApiConfig = async () => {
+    if (pushApiUnavailableRef.current) {
+      return null;
+    }
+
+    if (pushApiBaseUrlRef.current) {
+      const response = await fetch(
+        `${pushApiBaseUrlRef.current}/api/push/public-key`,
+        { method: "GET" },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        setPushDebug((prev) => ({
+          ...prev,
+          apiBaseUrl: pushApiBaseUrlRef.current,
+          lastResult: "push public key resolved",
+        }));
+        return {
+          baseUrl: pushApiBaseUrlRef.current,
+          publicKey: data.publicKey,
+        };
+      }
+
+      if (response.status === 503) {
+        pushApiUnavailableRef.current = true;
+        setPushSubscriptionStatus("server-unavailable");
+        setPushDebug((prev) => ({
+          ...prev,
+          apiBaseUrl: pushApiBaseUrlRef.current,
+          lastResult: "push public key returned 503",
+        }));
+        return null;
+      }
+
+      pushApiBaseUrlRef.current = null;
+    }
+
+    const baseUrls = getPushApiBaseUrls();
+
+    for (const baseUrl of baseUrls) {
+      try {
+        const response = await fetch(`${baseUrl}/api/push/public-key`, {
+          method: "GET",
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          pushApiBaseUrlRef.current = baseUrl;
+          setPushDebug((prev) => ({
+            ...prev,
+            apiBaseUrl: baseUrl,
+            lastResult: "push public key resolved",
+          }));
+          return {
+            baseUrl,
+            publicKey: data.publicKey,
+          };
+        }
+
+        if (response.status === 503) {
+          pushApiUnavailableRef.current = true;
+          setPushSubscriptionStatus("server-unavailable");
+          setPushDebug((prev) => ({
+            ...prev,
+            apiBaseUrl: baseUrl,
+            lastResult: "push public key returned 503",
+          }));
+          return null;
+        }
+      } catch {
+        // Try the next candidate URL.
+      }
+    }
+
+    setPushDebug((prev) => ({
+      ...prev,
+      lastResult: "push public key not found",
+    }));
+    return null;
   };
 
   const requestNotificationPermission = async () => {
@@ -328,7 +447,7 @@ function ChatInterface({ auth, onLogout }) {
   };
 
   const syncPushSubscription = async ({ silent = false } = {}) => {
-    if (!supportsPushNotifications || !auth?.token) {
+    if (!supportsPushNotifications || !auth?.token || pushApiUnavailableRef.current) {
       return false;
     }
 
@@ -339,8 +458,20 @@ function ChatInterface({ auth, onLogout }) {
         return false;
       }
 
-      const keyResponse = await axios.get(`${API_BASE_URL}/api/push/public-key`);
-      const applicationServerKey = urlBase64ToUint8Array(keyResponse.data.publicKey);
+      const pushApiConfig = await getPushApiConfig();
+      if (!pushApiConfig?.publicKey) {
+        setPushSubscriptionStatus("server-unavailable");
+        setPushDebug((prev) => ({
+          ...prev,
+          lastResult: "push configuration unavailable",
+        }));
+        if (!silent) {
+          setError("Push notification service is not available on this deployment.");
+        }
+        return false;
+      }
+
+      const applicationServerKey = urlBase64ToUint8Array(pushApiConfig.publicKey);
 
       let subscription = await registration.pushManager.getSubscription();
       if (!subscription) {
@@ -351,12 +482,18 @@ function ChatInterface({ auth, onLogout }) {
       }
 
       await axios.post(
-        `${API_BASE_URL}/api/push/subscribe`,
+        `${pushApiConfig.baseUrl}/api/push/subscribe`,
         { subscription: subscription.toJSON() },
         { headers: { Authorization: `Bearer ${auth.token}` } },
       );
 
       setPushSubscriptionStatus("subscribed");
+      setPushDebug((prev) => ({
+        ...prev,
+        apiBaseUrl: pushApiConfig.baseUrl,
+        endpoint: subscription.endpoint,
+        lastResult: "push subscription saved",
+      }));
       if (!silent) {
         setError("");
       }
@@ -364,6 +501,10 @@ function ChatInterface({ auth, onLogout }) {
     } catch (pushError) {
       if (axios.isAxiosError(pushError) && pushError.response?.status === 503) {
         setPushSubscriptionStatus("server-unavailable");
+        setPushDebug((prev) => ({
+          ...prev,
+          lastResult: "push subscribe returned 503",
+        }));
         if (!silent) {
           setError("Push notifications are not configured on the server.");
         }
@@ -371,6 +512,10 @@ function ChatInterface({ auth, onLogout }) {
       }
 
       setPushSubscriptionStatus("error");
+      setPushDebug((prev) => ({
+        ...prev,
+        lastResult: "push subscribe failed",
+      }));
       if (!silent) {
         setError("Unable to enable push notifications.");
       }
@@ -392,8 +537,9 @@ function ChatInterface({ auth, onLogout }) {
       }
 
       if (auth?.token) {
+        const pushApiConfig = await getPushApiConfig();
         await axios.post(
-          `${API_BASE_URL}/api/push/unsubscribe`,
+          `${pushApiConfig?.baseUrl || API_BASE_URL}/api/push/unsubscribe`,
           { endpoint: subscription.endpoint },
           { headers: { Authorization: `Bearer ${auth.token}` } },
         );
@@ -401,6 +547,11 @@ function ChatInterface({ auth, onLogout }) {
 
       await subscription.unsubscribe();
       setPushSubscriptionStatus("idle");
+      setPushDebug((prev) => ({
+        ...prev,
+        endpoint: "not subscribed",
+        lastResult: "push subscription removed",
+      }));
     } catch {
       // ignore unsubscribe failures during logout
     }
@@ -980,7 +1131,11 @@ function ChatInterface({ auth, onLogout }) {
   }, [chats]);
 
   useEffect(() => {
-    if (!auth?.token || notificationPermission !== "granted") {
+    if (
+      !auth?.token ||
+      notificationPermission !== "granted" ||
+      pushApiUnavailableRef.current
+    ) {
       return;
     }
 
@@ -1113,6 +1268,15 @@ function ChatInterface({ auth, onLogout }) {
             >
               {pushSubscriptionStatus === "subscribed" ? "Enabled" : "Enable notifications"}
             </button>
+          </div>
+          <div className="mt-3 rounded-md border border-slate-200 bg-slate-50 p-3 text-[11px] text-slate-700">
+            <div className="font-semibold text-slate-900">Push Debug</div>
+            <div className="mt-2">Permission: {notificationPermission}</div>
+            <div>Status: {pushSubscriptionStatus}</div>
+            <div>Service worker: {pushDebug.serviceWorker}</div>
+            <div className="break-all">API base: {pushDebug.apiBaseUrl}</div>
+            <div className="break-all">Endpoint: {pushDebug.endpoint}</div>
+            <div>Last result: {pushDebug.lastResult}</div>
           </div>
         </header>
 
