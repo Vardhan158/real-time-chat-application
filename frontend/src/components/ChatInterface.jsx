@@ -8,6 +8,11 @@ const RTC_CONFIGURATION = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
 
+const normalizeMessage = (message) => ({
+  ...message,
+  createdAt: message.createdAt || new Date().toISOString(),
+});
+
 function ChatInterface({ auth, onLogout }) {
   const [users, setUsers] = useState([]);
   const [chats, setChats] = useState([]);
@@ -28,10 +33,11 @@ function ChatInterface({ auth, onLogout }) {
   const localStreamRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const callChatIdRef = useRef(null);
+  const callStateRef = useRef("idle");
+  const incomingNotificationRef = useRef(null);
   const incomingCallChatIdRef = useRef(null);
   const pendingCandidatesRef = useRef([]);
   const [timestampUpdate, setTimestampUpdate] = useState(0);
-  const [showSidebar, setShowSidebar] = useState(true);
   const [searchTerm, setSearchTerm] = useState("");
   const [unreadByChat, setUnreadByChat] = useState({});
 
@@ -51,6 +57,30 @@ function ChatInterface({ auth, onLogout }) {
     () => chats.find((chat) => chat._id === activeChatId),
     [activeChatId, chats],
   );
+  const isActiveChatCall = activeChat?._id && callChatId === activeChat._id;
+  const isIncomingForActiveChat = incomingCall?.chatId === activeChat?._id;
+  const isBusyOnAnotherChat =
+    callState !== "idle" && callChatId && activeChat?._id && callChatId !== activeChat._id;
+  const canStartCall = Boolean(activeChat?._id) && callState === "idle";
+
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+
+    const originalTitle = "frontend";
+    document.title = incomingCall
+      ? `Incoming call: ${incomingCall.fromUserName || "User"}`
+      : originalTitle;
+
+    return () => {
+      document.title = originalTitle;
+    };
+  }, [incomingCall]);
 
   const getChatTitle = (chat) => {
     if (!chat?.participants || !auth?.user) {
@@ -65,11 +95,7 @@ function ChatInterface({ auth, onLogout }) {
   };
 
   const appendMessage = (chatId, message) => {
-    // Ensure message has a valid timestamp
-    const messageWithTimestamp = {
-      ...message,
-      createdAt: message.createdAt || new Date().toISOString(),
-    };
+    const messageWithTimestamp = normalizeMessage(message);
 
     setChats((prevChats) =>
       prevChats.map((chat) => {
@@ -169,7 +195,57 @@ function ChatInterface({ auth, onLogout }) {
     setIncomingCall(callData);
   };
 
+  const closeIncomingNotification = () => {
+    if (!incomingNotificationRef.current) {
+      return;
+    }
+
+    incomingNotificationRef.current.close();
+    incomingNotificationRef.current = null;
+  };
+
+  const requestNotificationPermission = async () => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      return "unsupported";
+    }
+
+    if (Notification.permission !== "default") {
+      return Notification.permission;
+    }
+
+    try {
+      return await Notification.requestPermission();
+    } catch {
+      return "denied";
+    }
+  };
+
+  const notifyIncomingCall = async ({ chatId, fromUserName }) => {
+    const permission = await requestNotificationPermission();
+    if (permission !== "granted" || typeof window === "undefined") {
+      return;
+    }
+
+    closeIncomingNotification();
+
+    const notification = new Notification("Incoming video call", {
+      body: `${fromUserName || "Someone"} is calling you.`,
+      tag: `incoming-call:${chatId}`,
+      requireInteraction: true,
+    });
+
+    notification.onclick = () => {
+      window.focus();
+      setActiveChatId(chatId);
+      closeIncomingNotification();
+    };
+
+    incomingNotificationRef.current = notification;
+  };
+
   const resetCallResources = () => {
+    closeIncomingNotification();
+
     if (peerConnectionRef.current) {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
@@ -182,6 +258,7 @@ function ChatInterface({ auth, onLogout }) {
 
     pendingCandidatesRef.current = [];
     callChatIdRef.current = null;
+    callStateRef.current = "idle";
     incomingCallChatIdRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
@@ -211,10 +288,11 @@ function ChatInterface({ auth, onLogout }) {
     }
 
     const connection = new RTCPeerConnection(RTC_CONFIGURATION);
+    const inboundStream = new MediaStream();
     peerConnectionRef.current = connection;
     callChatIdRef.current = chatId;
     setCallChatId(chatId);
-    setRemoteStream(null);
+    setRemoteStream(inboundStream);
 
     if (localStreamRef.current) {
       localStreamRef.current
@@ -223,10 +301,8 @@ function ChatInterface({ auth, onLogout }) {
     }
 
     connection.ontrack = (event) => {
-      const [stream] = event.streams;
-      if (stream) {
-        setRemoteStream(stream);
-      }
+      inboundStream.addTrack(event.track);
+      setRemoteStream(new MediaStream(inboundStream.getTracks()));
     };
 
     connection.onicecandidate = (event) => {
@@ -237,7 +313,27 @@ function ChatInterface({ auth, onLogout }) {
       socketRef.current.emit("call_ice_candidate", {
         chatId,
         candidate: event.candidate,
-      });
+        });
+    };
+
+    connection.onconnectionstatechange = () => {
+      if (peerConnectionRef.current !== connection) {
+        return;
+      }
+
+      const state = connection.connectionState;
+
+      if (state === "connected") {
+        callStateRef.current = "in-call";
+        setCallState("in-call");
+        setError("");
+        return;
+      }
+
+      if (state === "failed" || state === "disconnected") {
+        resetCallResources();
+        setError("Video call connection ended.");
+      }
     };
 
     return connection;
@@ -259,7 +355,7 @@ function ChatInterface({ auth, onLogout }) {
   };
 
   const handleStartCall = async () => {
-    if (!activeChat?._id || !socketRef.current) {
+    if (!activeChat?._id || !socketRef.current || callStateRef.current !== "idle") {
       return;
     }
 
@@ -275,6 +371,7 @@ function ChatInterface({ auth, onLogout }) {
       });
 
       setIncomingCallState(null);
+      callStateRef.current = "calling";
       setCallState("calling");
       setError("");
     } catch {
@@ -284,7 +381,7 @@ function ChatInterface({ auth, onLogout }) {
   };
 
   const handleAcceptCall = async () => {
-    if (!incomingCall || !socketRef.current) {
+    if (!incomingCall || !socketRef.current || callStateRef.current === "in-call") {
       return;
     }
 
@@ -304,7 +401,8 @@ function ChatInterface({ auth, onLogout }) {
 
       setActiveChatId(incomingCall.chatId);
       setIncomingCallState(null);
-      setCallState("in-call");
+      callStateRef.current = "connecting";
+      setCallState("connecting");
       setError("");
     } catch {
       resetCallResources();
@@ -321,8 +419,7 @@ function ChatInterface({ auth, onLogout }) {
       chatId: incomingCall.chatId,
     });
 
-    setIncomingCallState(null);
-    setCallState("idle");
+    resetCallResources();
   };
 
   const handleEndCall = () => {
@@ -450,10 +547,7 @@ function ChatInterface({ auth, onLogout }) {
         // Ensure all messages have timestamps
         const chatsWithTimestamps = chatsResponse.data.map(chat => ({
           ...chat,
-          messages: chat.messages.map(message => ({
-            ...message,
-            createdAt: message.createdAt || new Date().toISOString(),
-          })),
+          messages: chat.messages.map((message) => normalizeMessage(message)),
         }));
         setChats(chatsWithTimestamps);
         
@@ -528,14 +622,28 @@ function ChatInterface({ auth, onLogout }) {
         return;
       }
 
-      setActiveChatId((current) => current ?? chatId);
+      if (callStateRef.current !== "idle" && chatId !== callChatIdRef.current) {
+        socket.emit("call_reject", { chatId });
+        return;
+      }
+
+      setActiveChatId(chatId);
       setCallChatId(chatId);
+      callStateRef.current = "ringing";
       setCallState("ringing");
       setIncomingCallState({
         chatId,
         fromUserName,
         offer,
       });
+
+      if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
+        notifyIncomingCall({ chatId, fromUserName });
+      }
+
+      if (typeof navigator !== "undefined" && "vibrate" in navigator) {
+        navigator.vibrate([300, 150, 300, 150, 300]);
+      }
     });
 
     socket.on("call_answer", async ({ chatId, answer }) => {
@@ -548,7 +656,9 @@ function ChatInterface({ auth, onLogout }) {
           new RTCSessionDescription(answer),
         );
         await flushPendingCandidates();
-        setCallState("in-call");
+        setIncomingCallState(null);
+        callStateRef.current = "connecting";
+        setCallState("connecting");
       } catch {
         resetCallResources();
         setError("Video call connection failed.");
@@ -624,14 +734,12 @@ function ChatInterface({ auth, onLogout }) {
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
+
+    closeIncomingNotification();
   }, []);
 
   const filteredUsers = users.filter((user) =>
     user.name.toLowerCase().includes(searchTerm.toLowerCase()),
-  );
-
-  const filteredChats = chats.filter((chat) =>
-    getChatTitle(chat).toLowerCase().includes(searchTerm.toLowerCase()),
   );
 
   const formatMessageTime = (timestamp) => {
@@ -710,8 +818,8 @@ function ChatInterface({ auth, onLogout }) {
   }
 
   return (
-    <div className={`flex min-h-screen bg-gray-100 ${showSidebar ? '' : 'sidebar-hidden'}`}>
-      <aside className={`w-80 bg-white border-r border-gray-200 flex flex-col ${showSidebar ? '' : 'hidden'}`}>
+    <div className="flex min-h-screen bg-gray-100">
+      <aside className="flex w-80 max-w-full shrink-0 flex-col border-r border-gray-200 bg-white">
         <header className="p-4 border-b border-gray-200 flex items-center">
           <div className="flex items-center space-x-2">
             <span className="font-medium text-gray-900">{auth.user.name}</span>
@@ -786,7 +894,7 @@ function ChatInterface({ auth, onLogout }) {
         </section>
       </aside>
 
-      <main className="flex-1 flex flex-col">
+      <main className="flex-1 flex min-h-screen flex-col">
         {!activeChat ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center text-gray-500">
@@ -795,12 +903,17 @@ function ChatInterface({ auth, onLogout }) {
           </div>
         ) : (
           <>
-            <header className="bg-white border-b border-gray-200 p-4 flex items-center justify-between">
+            <header className="bg-white border-b border-gray-200 p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center space-x-4">
                 <h2 className="text-xl font-semibold text-gray-900">{getChatTitle(activeChat)}</h2>
+                {callState !== "idle" && callChatId && (
+                  <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
+                    {callState === "ringing" && isIncomingForActiveChat ? "Incoming call" : callState.replace("-", " ")}
+                  </span>
+                )}
               </div>
 
-              <div className="flex space-x-2">
+              <div className="flex flex-wrap gap-2">
                 {callState === "in-call" && callChatId === activeChat._id && (
                   <button
                     onClick={handleEndCall}
@@ -833,7 +946,15 @@ function ChatInterface({ auth, onLogout }) {
                     Cancel Call
                   </button>
                 )}
-                {callState === "idle" && (
+                {callState === "connecting" && callChatId === activeChat._id && (
+                  <button
+                    onClick={handleEndCall}
+                    className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+                  >
+                    End Call
+                  </button>
+                )}
+                {canStartCall && (
                   <button
                     onClick={handleStartCall}
                     className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
@@ -841,13 +962,25 @@ function ChatInterface({ auth, onLogout }) {
                     Video Call
                   </button>
                 )}
+                {isBusyOnAnotherChat && (
+                  <span className="px-3 py-2 text-sm text-gray-500">
+                    A call is active in another chat.
+                  </span>
+                )}
               </div>
             </header>
 
-            {(callChatId === activeChat._id || incomingCall?.chatId === activeChat._id) && (
-              <section className="flex-1 bg-black relative flex items-center justify-center overflow-hidden">
-                {/* Main video */}
-                <div className="w-full h-full bg-gray-900 flex items-center justify-center relative">
+            {(isActiveChatCall || isIncomingForActiveChat) && (
+              <section className="shrink-0 bg-slate-950 px-4 py-4 sm:px-6">
+                <div className="mb-3 flex items-center justify-between text-sm text-slate-200">
+                  <span>
+                    {callState === "calling" && `Calling ${getChatTitle(activeChat)}...`}
+                    {callState === "ringing" && incomingCall?.chatId === activeChat._id && `Incoming call from ${incomingCall.fromUserName || getChatTitle(activeChat)}`}
+                    {callState === "connecting" && `Connecting to ${getChatTitle(activeChat)}...`}
+                    {callState === "in-call" && `In call with ${getChatTitle(activeChat)}`}
+                  </span>
+                </div>
+                <div className="relative h-[38vh] min-h-[260px] overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 sm:h-[44vh] sm:min-h-[320px]">
                   {remoteStream ? (
                     <video
                       ref={remoteVideoRef}
@@ -856,11 +989,12 @@ function ChatInterface({ auth, onLogout }) {
                       className="w-full h-full object-cover"
                     />
                   ) : (
-                    <div className="text-white text-2xl">Waiting for {getChatTitle(activeChat)}...</div>
+                    <div className="flex h-full items-center justify-center px-6 text-center text-lg text-slate-200">
+                      Waiting for {getChatTitle(activeChat)} to join the call.
+                    </div>
                   )}
 
-                  {/* Picture-in-picture local video */}
-                  <div className="absolute bottom-6 right-6 w-48 h-40 bg-gray-800 rounded-lg overflow-hidden border-2 border-white shadow-lg">
+                  <div className="absolute bottom-4 right-4 h-28 w-24 overflow-hidden rounded-xl border border-white/30 bg-slate-800 shadow-lg sm:h-40 sm:w-48">
                     {localStream ? (
                       <video
                         ref={localVideoRef}

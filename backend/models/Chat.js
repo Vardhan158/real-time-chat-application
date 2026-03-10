@@ -22,7 +22,10 @@ const messageSchema = new mongoose.Schema(
       required: true,
     },
   },
-  { _id: true },
+  {
+    _id: true,
+    timestamps: true,
+  },
 );
 
 const chatSchema = new mongoose.Schema(
