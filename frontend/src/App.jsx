@@ -6,17 +6,17 @@ const AUTH_STORAGE_KEY = "chat-auth";
 
 function App() {
   const [auth, setAuth] = useState(() => {
-    const saved = sessionStorage.getItem(AUTH_STORAGE_KEY);
+    const saved = localStorage.getItem(AUTH_STORAGE_KEY);
     return saved ? JSON.parse(saved) : null;
   });
 
   const handleAuthSuccess = (authData) => {
-    sessionStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authData));
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authData));
     setAuth(authData);
   };
 
   const handleLogout = () => {
-    sessionStorage.removeItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(AUTH_STORAGE_KEY);
     setAuth(null);
   };
 

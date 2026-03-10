@@ -3,7 +3,6 @@ import axios from "axios";
 import { io } from "socket.io-client";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || "https://real-time-chat-backend-uvr5.onrender.com";
-const AUTH_STORAGE_KEY = "chat-auth";
 const RTC_CONFIGURATION = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 };
@@ -32,6 +31,7 @@ function ChatInterface({ auth, onLogout }) {
   const remoteVideoRef = useRef(null);
   const localStreamRef = useRef(null);
   const peerConnectionRef = useRef(null);
+  const pushRegistrationRef = useRef(null);
   const callChatIdRef = useRef(null);
   const callStateRef = useRef("idle");
   const incomingNotificationRef = useRef(null);
@@ -42,6 +42,7 @@ function ChatInterface({ auth, onLogout }) {
   const [searchTerm, setSearchTerm] = useState("");
   const [unreadByChat, setUnreadByChat] = useState({});
   const [notificationPermission, setNotificationPermission] = useState("unsupported");
+  const [pushSubscriptionStatus, setPushSubscriptionStatus] = useState("unsupported");
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -52,17 +53,46 @@ function ChatInterface({ auth, onLogout }) {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !("Notification" in window)) {
+    if (
+      typeof window === "undefined" ||
+      !("Notification" in window) ||
+      !("serviceWorker" in navigator) ||
+      !("PushManager" in window)
+    ) {
       setNotificationPermission("unsupported");
+      setPushSubscriptionStatus("unsupported");
       return;
     }
 
     setNotificationPermission(Notification.permission);
+    setPushSubscriptionStatus("idle");
+
+    const registerServiceWorker = async () => {
+      try {
+        const registration = await navigator.serviceWorker.register("/sw.js");
+        pushRegistrationRef.current = registration;
+
+        const existingSubscription = await registration.pushManager.getSubscription();
+        if (existingSubscription) {
+          setPushSubscriptionStatus("subscribed");
+        }
+      } catch {
+        setPushSubscriptionStatus("error");
+      }
+    };
+
+    registerServiceWorker();
   }, []);
 
   const authHeaders = auth?.token
     ? { Authorization: `Bearer ${auth.token}` }
     : undefined;
+
+  const supportsPushNotifications =
+    typeof window !== "undefined" &&
+    "Notification" in window &&
+    "serviceWorker" in navigator &&
+    "PushManager" in window;
 
   const activeChat = useMemo(
     () => chats.find((chat) => chat._id === activeChatId),
@@ -152,8 +182,9 @@ function ChatInterface({ auth, onLogout }) {
     if (messageWithTimestamp.senderId !== auth.user.id) {
       const shouldIncrementUnread = chatId !== activeChatId;
       const shouldNotifyInBrowser =
-        shouldIncrementUnread ||
-        (typeof document !== "undefined" && (document.hidden || !document.hasFocus()));
+        pushSubscriptionStatus !== "subscribed" &&
+        (shouldIncrementUnread ||
+          (typeof document !== "undefined" && (document.hidden || !document.hasFocus())));
 
       if (shouldIncrementUnread) {
         setUnreadByChat((prev) => ({
@@ -246,6 +277,35 @@ function ChatInterface({ auth, onLogout }) {
     messageNotificationsRef.current.clear();
   };
 
+  const urlBase64ToUint8Array = (base64String) => {
+    const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+    const normalized = (base64String + padding)
+      .replaceAll("-", "+")
+      .replaceAll("_", "/");
+    const rawData = window.atob(normalized);
+    const outputArray = new Uint8Array(rawData.length);
+
+    for (let index = 0; index < rawData.length; index += 1) {
+      outputArray[index] = rawData.charCodeAt(index);
+    }
+
+    return outputArray;
+  };
+
+  const getServiceWorkerRegistration = async () => {
+    if (!supportsPushNotifications) {
+      return null;
+    }
+
+    if (pushRegistrationRef.current) {
+      return pushRegistrationRef.current;
+    }
+
+    const registration = await navigator.serviceWorker.register("/sw.js");
+    pushRegistrationRef.current = registration;
+    return registration;
+  };
+
   const requestNotificationPermission = async () => {
     if (typeof window === "undefined" || !("Notification" in window)) {
       setNotificationPermission("unsupported");
@@ -267,18 +327,107 @@ function ChatInterface({ auth, onLogout }) {
     }
   };
 
+  const syncPushSubscription = async ({ silent = false } = {}) => {
+    if (!supportsPushNotifications || !auth?.token) {
+      return false;
+    }
+
+    try {
+      const registration = await getServiceWorkerRegistration();
+      if (!registration) {
+        setPushSubscriptionStatus("unsupported");
+        return false;
+      }
+
+      const keyResponse = await axios.get(`${API_BASE_URL}/api/push/public-key`);
+      const applicationServerKey = urlBase64ToUint8Array(keyResponse.data.publicKey);
+
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        });
+      }
+
+      await axios.post(
+        `${API_BASE_URL}/api/push/subscribe`,
+        { subscription: subscription.toJSON() },
+        { headers: { Authorization: `Bearer ${auth.token}` } },
+      );
+
+      setPushSubscriptionStatus("subscribed");
+      if (!silent) {
+        setError("");
+      }
+      return true;
+    } catch (pushError) {
+      if (axios.isAxiosError(pushError) && pushError.response?.status === 503) {
+        setPushSubscriptionStatus("server-unavailable");
+        if (!silent) {
+          setError("Push notifications are not configured on the server.");
+        }
+        return false;
+      }
+
+      setPushSubscriptionStatus("error");
+      if (!silent) {
+        setError("Unable to enable push notifications.");
+      }
+      return false;
+    }
+  };
+
+  const unsubscribePushNotifications = async () => {
+    if (!supportsPushNotifications) {
+      return;
+    }
+
+    try {
+      const registration = await getServiceWorkerRegistration();
+      const subscription = await registration?.pushManager.getSubscription();
+      if (!subscription) {
+        setPushSubscriptionStatus("idle");
+        return;
+      }
+
+      if (auth?.token) {
+        await axios.post(
+          `${API_BASE_URL}/api/push/unsubscribe`,
+          { endpoint: subscription.endpoint },
+          { headers: { Authorization: `Bearer ${auth.token}` } },
+        );
+      }
+
+      await subscription.unsubscribe();
+      setPushSubscriptionStatus("idle");
+    } catch {
+      // ignore unsubscribe failures during logout
+    }
+  };
+
   const handleEnableNotifications = async () => {
-    await requestNotificationPermission();
+    const permission = await requestNotificationPermission();
+    if (permission !== "granted") {
+      setError("Allow notifications for this site in your browser settings.");
+      return;
+    }
+
+    await syncPushSubscription();
   };
 
   const notificationStatusLabel =
-    notificationPermission === "granted"
-      ? "Notifications on"
+    notificationPermission === "unsupported" || pushSubscriptionStatus === "unsupported"
+      ? "Notifications unsupported"
       : notificationPermission === "denied"
         ? "Notifications blocked"
-        : notificationPermission === "default"
-          ? "Notifications off"
-          : "Notifications unsupported";
+        : pushSubscriptionStatus === "subscribed"
+          ? "Notifications on"
+          : pushSubscriptionStatus === "server-unavailable"
+            ? "Server push unavailable"
+            : notificationPermission === "granted"
+              ? "Permission granted"
+              : "Notifications off";
 
   const notifyIncomingCall = async ({ chatId, fromUserName }) => {
     const permission = await requestNotificationPermission();
@@ -807,6 +956,37 @@ function ChatInterface({ auth, onLogout }) {
     }
   }, [activeChatId, chats]);
 
+  useEffect(() => {
+    if (typeof window === "undefined" || chats.length === 0) {
+      return;
+    }
+
+    const searchParams = new URLSearchParams(window.location.search);
+    const requestedChatId = searchParams.get("chatId");
+    if (!requestedChatId) {
+      return;
+    }
+
+    if (!chats.some((chat) => chat._id === requestedChatId)) {
+      return;
+    }
+
+    setActiveChatId(requestedChatId);
+    searchParams.delete("chatId");
+
+    const nextSearch = searchParams.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+    window.history.replaceState({}, "", nextUrl);
+  }, [chats]);
+
+  useEffect(() => {
+    if (!auth?.token || notificationPermission !== "granted") {
+      return;
+    }
+
+    syncPushSubscription({ silent: true });
+  }, [auth?.token, notificationPermission]);
+
   // Clear unread count when switching to a chat
   useEffect(() => {
     if (activeChatId) {
@@ -893,7 +1073,8 @@ function ChatInterface({ auth, onLogout }) {
     return `${dateStr} ${timeStr}`;
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await unsubscribePushNotifications();
     resetCallResources();
     onLogout();
   };
@@ -923,10 +1104,14 @@ function ChatInterface({ auth, onLogout }) {
             <span className="text-xs text-gray-500">{notificationStatusLabel}</span>
             <button
               onClick={handleEnableNotifications}
-              disabled={notificationPermission === "granted" || notificationPermission === "unsupported"}
+              disabled={
+                notificationPermission === "unsupported" ||
+                pushSubscriptionStatus === "unsupported" ||
+                pushSubscriptionStatus === "subscribed"
+              }
               className="px-3 py-1 text-xs bg-slate-800 text-white rounded hover:bg-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {notificationPermission === "granted" ? "Enabled" : "Enable notifications"}
+              {pushSubscriptionStatus === "subscribed" ? "Enabled" : "Enable notifications"}
             </button>
           </div>
         </header>
